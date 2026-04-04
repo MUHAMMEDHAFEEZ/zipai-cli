@@ -1,0 +1,21 @@
+{
+  "name": "zipai",
+  "version": "1.0.0",
+  "description": "Token-efficient AI CLI using DOT format with built-in token limits and Simplified Chinese output",
+  "type": "module",
+  "bin": {
+    "zipai": "./bin/zipai.js"
+  },
+  "scripts": {
+    "start": "node bin/zipai.js",
+    "test": "node --test test"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "chalk": "^5.3.0",
+    "commander": "^12.0.0",
+    "dotenv": "^16.4.5",
+    "ora": "^8.0.1",
+    "tiktoken": "^1.0.15"
+  }
+}

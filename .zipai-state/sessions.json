@@ -1,0 +1,14 @@
+{
+  "active": "s_mnkqr9g4_o8kduw",
+  "sessions": [
+    {
+      "id": "s_mnkqr9g4_o8kduw",
+      "name": "Session 1",
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-20250514",
+      "createdAt": "2026-04-04T19:44:29.332Z",
+      "updatedAt": "2026-04-04T19:44:29.332Z",
+      "history": []
+    }
+  ]
+}
