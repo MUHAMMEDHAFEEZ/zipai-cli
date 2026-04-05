@@ -694,6 +694,8 @@ function printPluginList() {
 
 function openCommandPalette(rl, cfg, state, client) {
   state.paletteOpen = true;
+  state.ignoreCurrentKeypress = true;
+  process.nextTick(() => { state.ignoreCurrentKeypress = false; });
   state.paletteItems = buildPaletteItems(cfg, state, client);
   state.paletteQuery = '';
   state.paletteSelection = 0;
@@ -714,6 +716,8 @@ function openProviderPalette(rl, cfg, state, client) {
   }
 
   state.paletteOpen = true;
+  state.ignoreCurrentKeypress = true;
+  process.nextTick(() => { state.ignoreCurrentKeypress = false; });
   state.paletteItems = rows.map((row) => {
     const readiness = row.chatReady ? 'ready' : 'planned';
     const keyState = row.configured ? 'key' : 'no-key';
@@ -782,6 +786,8 @@ function openModelPalette(rl, cfg, state, client) {
   }
 
   state.paletteOpen = true;
+  state.ignoreCurrentKeypress = true;
+  process.nextTick(() => { state.ignoreCurrentKeypress = false; });
   state.paletteItems = items;
   state.paletteQuery = '';
   state.paletteSelection = Math.max(
@@ -978,6 +984,7 @@ function buildPaletteItems(cfg, state, client) {
 
 function handlePaletteKeypress(str, key, rl, cfg, state, _client) {
   if (state.paletteBusy) return;
+  if (state.ignoreCurrentKeypress) return;
 
   if (key.name === 'escape') {
     closeCommandPalette(rl, cfg, state);
@@ -1284,7 +1291,9 @@ function formatPalettePanelLine(layout, content, { selected = false } = {}) {
   const pad = ' '.repeat(layout.padLeft);
   const body = padToVisible(content, layout.bodyWidth);
   if (selected) {
-    return `${pad}${chalk.bgHex(THEME_HEX).hex('#0f1518')(`  ${body}  `)}`;
+    // Strip existing colors so they don't clash with the highlight background
+    const cleanBody = stripAnsi(body);
+    return `${pad}${chalk.bgHex(THEME_HEX).white.bold(`  ${cleanBody}  `)}`;
   }
   return `${pad}${chalk.bgHex('#111317')(`  ${body}  `)}`;
 }

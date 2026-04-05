@@ -42,16 +42,14 @@ function buildSystemPrompt(cfg) {
   const maxOut = cfg.maxTokens || 1024;
 
   const dotInstructions = [
-    `.cfg:lang=${lang}`,
+    `.cfg:lang=zh-CN`,
     `.cfg:output_lang=${langName}`,
     `.cfg:max_response_tokens=${maxOut}`,
     `.cfg:format=concise`,
     `.cfg:style=direct`,
   ].join('');
 
-  const rules = lang === 'zh-CN'
-    ? `用简体中文回答。简洁，直接，无废话。代码保持原语言。最多${maxOut}token。`
-    : `Reply in ${langName}. Be concise and direct. Code stays in original language. Max ${maxOut} tokens.`;
+  const rules = `用 ${langName} 回答。简洁，直接，无废话。代码保持原语言。最多${maxOut}token。`;
 
   return `${dotInstructions}\n${rules}`;
 }
