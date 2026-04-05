@@ -4,6 +4,7 @@
  */
 
 import * as readline from 'readline';
+import { Writable } from 'stream';
 import chalk from 'chalk';
 import { saveGlobalConfig } from './config.js';
 import { prettyPrintDot, compareFormats } from './dot.js';
@@ -27,6 +28,8 @@ const ACCENT_BOLD = chalk.bold.hex(THEME_HEX);
 const ACCENT_SOFT = chalk.hex(THEME_HEX);
 const ANSI_HIDE_CURSOR = '\x1b[?25l';
 const ANSI_SHOW_CURSOR = '\x1b[?25h';
+const ANSI_ALT_SCREEN_ENTER = '\x1b[?1049h';
+const ANSI_ALT_SCREEN_EXIT = '\x1b[?1049l';
 
 const MODE_PRESETS = [
   { mode: 'build', lang: 'zh-CN', modeLabel: 'Build', langLabel: 'Simplified Chinese' },
@@ -45,6 +48,22 @@ const LOGO_LINES = [
   '              ZIP.AI',
 ];
 
+const ASK_HINTS = [
+  'Fix broken tests',
+  'Refactor auth middleware',
+  'Explain this stack trace',
+  'Optimize token usage',
+  'Review this module design',
+];
+
+const TIP_HINTS = [
+  'Create JSON theme files in .opencode/themes/ directory',
+  'Use /models to switch provider and model quickly',
+  'Use /key save <provider> to persist API keys securely',
+  'Use /file <path> then send a prompt to attach code context',
+  'Use /session list and /session switch <id> to resume old work',
+];
+
 // Commands available in chat mode
 const COMMANDS = {
   '/exit':    'Exit chat',
@@ -58,7 +77,7 @@ const COMMANDS = {
   '/session switch <id>': 'Switch current session',
   '/providers': 'Open provider picker',
   '/provider <id|list>': 'Switch provider or open picker',
-  '/models':  'Open model picker',
+  '/models':  'Open provider+model picker',
   '/mode <build|plan>': 'Set current mode',
   '/model <id|next|list>': 'Switch model or open model picker',
   '/key [provider]': 'Set API key securely (session only)',
@@ -71,28 +90,37 @@ const COMMANDS = {
   '/help':    'Show this help',
 };
 
+function pickRandom(items) {
+  if (!Array.isArray(items) || items.length === 0) return '';
+  return items[Math.floor(Math.random() * items.length)];
+}
+
 export async function startRepl(client, cfg) {
   const state = createUiState(cfg);
 
+  // Route all readline output through a conditional sink.
+  // When composerActive/paletteOpen our TUI owns stdout entirely — readline
+  // must not write anything (prompt echo, _refreshLine, clearLine, etc.).
+  // When suppressEcho is set (password input) we swallow character echoes too.
+  const rlOutput = new Writable({
+    write(chunk, _enc, cb) {
+      if (!state.composerActive && !state.paletteOpen && !state.suppressEcho) {
+        process.stdout.write(chunk);
+      }
+      cb();
+    },
+  });
+
   const rl = readline.createInterface({
-    input:  process.stdin,
-    output: process.stdout,
-    prompt: ASK_PROMPT,
+    input:    process.stdin,
+    output:   rlOutput,
+    terminal: true,
+    prompt:   ASK_PROMPT,
     completer: (line) => [[], line],
   });
 
-  // While custom UI is active, we render input ourselves inside the panel.
-  const defaultWriteToOutput = typeof rl._writeToOutput === 'function'
-    ? rl._writeToOutput.bind(rl)
-    : null;
-  if (defaultWriteToOutput) {
-    rl._writeToOutput = (chunk) => {
-      if (state.composerActive || state.paletteOpen) return;
-      defaultWriteToOutput(chunk);
-    };
-  }
-
   const cleanupKeybindings = setupKeybindings(rl, cfg, state, client);
+  const exitImmersiveScreen = enterImmersiveScreen(state);
 
   renderHomeUi(cfg, state);
 
@@ -103,6 +131,7 @@ export async function startRepl(client, cfg) {
 
   const exitRepl = () => {
     setNativeCursorHidden(state, false);
+    exitImmersiveScreen();
     cleanupKeybindings();
     console.log(chalk.gray('\n  ' + client.tokenSummary + '\n'));
     process.exit(0);
@@ -123,6 +152,7 @@ export async function startRepl(client, cfg) {
     const line = input.trim();
     state.draftInput = '';
     state.cursorPos = 0;
+    state.pasteInfo = null;
     if (!line) {
       if (state.composerActive) {
         renderHomeUi(cfg, state);
@@ -401,6 +431,7 @@ export async function startRepl(client, cfg) {
 
   rl.on('close', () => {
     setNativeCursorHidden(state, false);
+    exitImmersiveScreen();
     cleanupKeybindings();
     console.log(chalk.gray('\n  ' + client.tokenSummary + '\n'));
     process.exit(0);
@@ -419,16 +450,49 @@ function createUiState(cfg) {
     mode: preset.mode,
     presetIndex,
     composerActive: true,
+    askHint: pickRandom(ASK_HINTS),
+    tipHint: pickRandom(TIP_HINTS),
     draftInput: '',
     cursorPos: 0,
+    pasteInfo: null,      // { lines, chars } when paste detected
+    suppressEcho: false,  // true during hidden password input
     nativeCursorHidden: false,
+    altScreenActive: false,
+    homeLayout: null,
     paletteOpen: false,
     paletteItems: [],
     paletteFiltered: [],
     paletteQuery: '',
     paletteSelection: 0,
+    paletteScroll: 0,
+    paletteLayout: null,
     paletteBusy: false,
     skipNextLine: false,
+  };
+}
+
+function enterImmersiveScreen(state) {
+  if (!process.stdout.isTTY || state.altScreenActive) {
+    return () => {};
+  }
+
+  state.altScreenActive = true;
+  process.stdout.write(ANSI_ALT_SCREEN_ENTER);
+  process.stdout.write('\x1b[2J\x1b[H');
+
+  const restore = () => {
+    if (!state.altScreenActive) return;
+    state.altScreenActive = false;
+    process.stdout.write(ANSI_SHOW_CURSOR);
+    process.stdout.write(ANSI_ALT_SCREEN_EXIT);
+  };
+
+  const onExit = () => restore();
+  process.once('exit', onExit);
+
+  return () => {
+    process.removeListener('exit', onExit);
+    restore();
   };
 }
 
@@ -461,20 +525,40 @@ function setupKeybindings(rl, cfg, state, client) {
     }
 
     if (!state.paletteOpen && key.name === 'tab') {
-      cyclePreset(cfg, state, client);
-      renderHomeUi(cfg, state);
-      rl.setPrompt(ASK_PROMPT);
-      rl.prompt();
+      state.mode = state.mode === 'build' ? 'plan' : 'build';
+      cfg.mode = state.mode;
+      syncPresetIndex(cfg, state);
+
+      // Prevent inserting a real tab character into the composing input.
+      if (typeof rl.line === 'string' && rl.line.includes('\t')) {
+        rl.line = rl.line.replace(/\t+/g, '');
+        rl.cursor = Math.min(rl.cursor, rl.line.length);
+      }
+
+      state.draftInput = rl.line || '';
+      state.cursorPos = typeof rl.cursor === 'number' ? rl.cursor : state.draftInput.length;
+      renderPanelInline(cfg, state);
       return;
     }
 
     if (!state.paletteOpen && state.composerActive && shouldRefreshComposer(_str, key)) {
       setImmediate(() => {
         if (state.paletteOpen || !state.composerActive) return;
+        const prevLen = state.draftInput.length;
         state.draftInput = rl.line || '';
         state.cursorPos = typeof rl.cursor === 'number' ? rl.cursor : state.draftInput.length;
-        renderHomeUi(cfg, state);
-        rl.prompt(true);
+
+        const delta = state.draftInput.length - prevLen;
+        if (delta > 30) {
+          // Burst of >30 chars at once → treat as paste
+          const lines = Math.max(1, Math.ceil(state.draftInput.length / 80));
+          state.pasteInfo = { lines, chars: state.draftInput.length };
+        } else if (delta <= 0) {
+          // Deleting / moving — clear paste indicator
+          state.pasteInfo = null;
+        }
+
+        renderPanelInline(cfg, state);
       });
     }
   };
@@ -613,6 +697,8 @@ function openCommandPalette(rl, cfg, state, client) {
   state.paletteItems = buildPaletteItems(cfg, state, client);
   state.paletteQuery = '';
   state.paletteSelection = 0;
+  state.paletteScroll = 0;
+  state.paletteLayout = null;
   state.paletteBusy = false;
   updatePaletteFilter(state);
   renderCommandPalette(state);
@@ -642,6 +728,8 @@ function openProviderPalette(rl, cfg, state, client) {
 
   state.paletteQuery = '';
   state.paletteSelection = Math.max(0, rows.findIndex((row) => row.active));
+  state.paletteScroll = 0;
+  state.paletteLayout = null;
   state.paletteBusy = false;
   updatePaletteFilter(state);
   renderCommandPalette(state);
@@ -649,23 +737,59 @@ function openProviderPalette(rl, cfg, state, client) {
 }
 
 function openModelPalette(rl, cfg, state, client) {
-  const models = listModels(cfg.provider);
-  if (models.length === 0) {
-    console.log(chalk.gray(`  no model catalog for provider: ${cfg.provider}`));
+  const providers = listProviderStatus(cfg);
+  const items = [];
+  let selectedItemId = null;
+
+  for (const provider of providers) {
+    const providerId = provider.id;
+    const providerName = provider.name || providerId;
+    const providerModels = listModels(providerId);
+
+    items.push({
+      id: `model-provider-${providerId}`,
+      label: `${providerName} (${providerId})`,
+      displayLabel: ACCENT_BOLD(`${providerName} (${providerId})`),
+      shortcut: provider.active ? 'current provider' : (provider.chatReady ? 'chat-ready' : 'planned'),
+      section: 'Providers',
+      run: () => switchProvider(cfg, client, providerId),
+    });
+
+    for (const modelId of providerModels) {
+      const modelFamily = getModelFamilyLabel(providerId, modelId);
+      const isActiveModel = cfg.provider === providerId && cfg.model === modelId;
+      const itemId = `model-${providerId}-${modelId}`;
+
+      items.push({
+        id: itemId,
+        label: `${providerName} ${modelFamily} ${modelId}`,
+        displayLabel: `${ACCENT('  •')} ${ACCENT_SOFT(modelFamily)} ${chalk.gray(modelId)}`,
+        shortcut: isActiveModel ? 'current model' : '',
+        section: `${providerName} models`,
+        run: () => setProviderAndModel(cfg, client, providerId, modelId),
+      });
+
+      if (isActiveModel) {
+        selectedItemId = itemId;
+      }
+    }
+  }
+
+  if (items.length === 0) {
+    console.log(chalk.gray('  no providers or model catalogs available'));
     rl.prompt();
     return;
   }
 
   state.paletteOpen = true;
-  state.paletteItems = models.map((model) => ({
-    id: `model-${model}`,
-    label: model,
-    shortcut: cfg.model === model ? 'current' : '',
-    section: `Models (${cfg.provider})`,
-    run: () => setModel(cfg, client, model),
-  }));
+  state.paletteItems = items;
   state.paletteQuery = '';
-  state.paletteSelection = Math.max(0, models.indexOf(cfg.model));
+  state.paletteSelection = Math.max(
+    0,
+    state.paletteItems.findIndex((item) => item.id === selectedItemId)
+  );
+  state.paletteScroll = 0;
+  state.paletteLayout = null;
   state.paletteBusy = false;
   updatePaletteFilter(state);
   renderCommandPalette(state);
@@ -677,6 +801,8 @@ function closeCommandPalette(rl, cfg, state) {
   state.paletteQuery = '';
   state.paletteFiltered = [];
   state.paletteSelection = 0;
+  state.paletteScroll = 0;
+  state.paletteLayout = null;
   state.paletteBusy = false;
   renderHomeUi(cfg, state);
   clearReadlineBuffer(rl);
@@ -827,13 +953,17 @@ function buildPaletteItems(cfg, state, client) {
     },
   ];
 
-  const modelItems = listModels(cfg.provider).map((model) => ({
-    id: `use-model-${model}`,
-    label: `Use ${model}`,
-    shortcut: cfg.model === model ? 'current' : '',
-    section: 'Models',
-    run: () => setModel(cfg, client, model),
-  }));
+  const modelItems = listProviderStatus(cfg).flatMap((row) => {
+    const providerId = row.id;
+    const providerName = row.name || providerId;
+    return listModels(providerId).map((model) => ({
+      id: `use-model-${providerId}-${model}`,
+      label: `Use ${providerName} / ${getModelFamilyLabel(providerId, model)}`,
+      shortcut: cfg.provider === providerId && cfg.model === model ? 'current' : '',
+      section: 'Models',
+      run: () => setProviderAndModel(cfg, client, providerId, model),
+    }));
+  });
 
   const providerItems = listProviderStatus(cfg).map((row) => ({
     id: `use-provider-${row.id}`,
@@ -857,7 +987,7 @@ function handlePaletteKeypress(str, key, rl, cfg, state, _client) {
   if (key.name === 'up') {
     if (state.paletteFiltered.length > 0) {
       state.paletteSelection = Math.max(0, state.paletteSelection - 1);
-      renderCommandPalette(state);
+      renderCommandPaletteViewportInline(state);
     }
     return;
   }
@@ -865,7 +995,7 @@ function handlePaletteKeypress(str, key, rl, cfg, state, _client) {
   if (key.name === 'down') {
     if (state.paletteFiltered.length > 0) {
       state.paletteSelection = Math.min(state.paletteFiltered.length - 1, state.paletteSelection + 1);
-      renderCommandPalette(state);
+      renderCommandPaletteViewportInline(state);
     }
     return;
   }
@@ -936,6 +1066,8 @@ function updatePaletteFilter(state) {
     });
   }
 
+  state.paletteScroll = 0;
+
   if (state.paletteFiltered.length === 0) {
     state.paletteSelection = 0;
     return;
@@ -970,55 +1102,199 @@ function clearReadlineBuffer(rl) {
 function renderCommandPalette(state) {
   setNativeCursorHidden(state, true);
 
-  const width = process.stdout.columns || 100;
-  const panelWidth = Math.max(64, Math.min(98, width - 8));
-  const bodyWidth = panelWidth - 4;
-  const padLeft = Math.max(2, Math.floor((width - panelWidth) / 2));
-  const pad = ' '.repeat(padLeft);
+  const layout = buildPaletteLayout();
+  state.paletteLayout = layout;
 
-  const bg = (text) => chalk.bgHex('#111317')(text);
-  const panel = (content) => {
-    const body = padToVisible(content, bodyWidth);
-    return `${pad}${bg(`  ${body}  `)}`;
+  const backdrop = (content = '') => chalk.bgBlack(padToVisible(content, layout.width));
+  const canvas = Array.from({ length: layout.rows }, () => backdrop(''));
+  const setRow = (rowNumber, text) => {
+    if (rowNumber < 1 || rowNumber > layout.rows) return;
+    canvas[rowNumber - 1] = backdrop(text);
   };
 
-  const grouped = groupBySection(state.paletteFiltered);
-
-  process.stdout.write('\x1b[2J\x1b[H');
-  console.log();
-  console.log(panel(alignRow(chalk.bold('Commands'), chalk.gray('esc'), bodyWidth)));
-  console.log(panel(''));
+  setRow(layout.panelTopRow, formatPalettePanelLine(layout, alignRow(chalk.bold('Commands'), chalk.gray('esc'), layout.bodyWidth)));
+  setRow(layout.panelTopRow + 1, formatPalettePanelLine(layout, ''));
   const searchLabel = state.paletteQuery
     ? `${ACCENT('Search')} ${state.paletteQuery}`
     : `${ACCENT('Search')} ${chalk.gray('type to filter...')}`;
-  console.log(panel(searchLabel));
-  console.log(panel(ACCENT_SOFT('Use ↑↓ to navigate, Enter to run')));
-  console.log(panel(''));
+  setRow(layout.panelTopRow + 2, formatPalettePanelLine(layout, searchLabel));
+  setRow(layout.panelTopRow + 4, formatPalettePanelLine(layout, ''));
 
-  if (state.paletteFiltered.length === 0) {
-    console.log(panel(ACCENT_SOFT('No matching commands')));
-    console.log(panel(''));
+  const viewport = buildPaletteViewportRows(state, layout);
+  setRow(layout.helpRow, formatPalettePanelLine(layout, viewport.helpLabel));
+
+  for (let i = 0; i < layout.listRowCount; i += 1) {
+    setRow(layout.listStartRow + i, viewport.lines[i] || formatPalettePanelLine(layout, ''));
+  }
+
+  process.stdout.write('\x1b[2J\x1b[H' + canvas.join('\n'));
+}
+
+function renderCommandPaletteViewportInline(state) {
+  if (!state.paletteOpen || !state.paletteLayout) {
     return;
   }
 
+  const layout = state.paletteLayout;
+  const currentWidth = process.stdout.columns || 100;
+  const currentRows = process.stdout.rows || 36;
+  if (layout.width !== currentWidth || layout.rows !== currentRows) {
+    renderCommandPalette(state);
+    return;
+  }
+
+  const backdrop = (content = '') => chalk.bgBlack(padToVisible(content, layout.width));
+  const viewport = buildPaletteViewportRows(state, layout);
+
+  process.stdout.write('\x1b7');
+  drawPaletteRowInline(layout, layout.helpRow, backdrop(formatPalettePanelLine(layout, viewport.helpLabel)));
+  for (let i = 0; i < layout.listRowCount; i += 1) {
+    const row = layout.listStartRow + i;
+    const line = viewport.lines[i] || formatPalettePanelLine(layout, '');
+    drawPaletteRowInline(layout, row, backdrop(line));
+  }
+  process.stdout.write('\x1b8');
+}
+
+function buildPaletteLayout() {
+  const width = process.stdout.columns || 100;
+  const rows = process.stdout.rows || 36;
+  const panelWidth = Math.max(64, Math.min(98, width - 8));
+  const bodyWidth = panelWidth - 4;
+  const padLeft = Math.max(2, Math.floor((width - panelWidth) / 2));
+  const panelTopRow = Math.max(2, Math.floor((rows - 24) / 2));
+  const helpRow = panelTopRow + 3;
+  const listStartRow = panelTopRow + 5;
+  const listRowCount = Math.max(1, rows - listStartRow - 1);
+
+  return {
+    width,
+    rows,
+    panelWidth,
+    bodyWidth,
+    padLeft,
+    panelTopRow,
+    helpRow,
+    listStartRow,
+    listRowCount,
+  };
+}
+
+function buildPaletteRenderEntries(state, bodyWidth) {
+  const grouped = groupBySection(state.paletteFiltered);
+  const selectedItemId = state.paletteFiltered[state.paletteSelection]?.id;
+  const entries = [];
+  let selectedEntryIndex = -1;
   let itemIndex = 0;
+
   for (const [section, items] of Object.entries(grouped)) {
-    console.log(panel(ACCENT_BOLD(section)));
+    entries.push({ kind: 'section', content: ACCENT_BOLD(section), selected: false });
+
     for (const item of items) {
       itemIndex += 1;
       const indexLabel = String(itemIndex).padStart(2, '0');
-      const left = `${chalk.bold(indexLabel)} ${item.label}`;
+      const leftLabel = item.displayLabel || item.label;
+      const left = `${chalk.bold(indexLabel)} ${leftLabel}`;
       const right = item.shortcut ? ACCENT_SOFT(item.shortcut) : '';
-      const row = alignRow(left, right, bodyWidth);
-      const selected = state.paletteFiltered[state.paletteSelection]?.id === item.id;
+      const selected = item.id === selectedItemId;
+
+      entries.push({
+        kind: 'item',
+        content: alignRow(left, right, bodyWidth),
+        selected,
+      });
+
       if (selected) {
-        console.log(`${pad}${chalk.bgHex(THEME_HEX).hex('#0f1518')(`  ${padToVisible(row, bodyWidth)}  `)}`);
-      } else {
-        console.log(panel(row));
+        selectedEntryIndex = entries.length - 1;
       }
     }
-    console.log(panel(''));
+
+    entries.push({ kind: 'spacer', content: '', selected: false });
   }
+
+  if (entries.length > 0 && entries[entries.length - 1].kind === 'spacer') {
+    entries.pop();
+  }
+
+  return { entries, selectedEntryIndex };
+}
+
+function syncPaletteScroll(state, entriesLength, selectedEntryIndex, listRowCount) {
+  const maxScroll = Math.max(0, entriesLength - listRowCount);
+  let nextScroll = Math.max(0, Math.min(state.paletteScroll || 0, maxScroll));
+
+  if (selectedEntryIndex >= 0) {
+    if (selectedEntryIndex < nextScroll) {
+      nextScroll = selectedEntryIndex;
+    }
+    if (selectedEntryIndex >= nextScroll + listRowCount) {
+      nextScroll = selectedEntryIndex - listRowCount + 1;
+    }
+  }
+
+  state.paletteScroll = Math.max(0, Math.min(nextScroll, maxScroll));
+}
+
+function buildPaletteViewportRows(state, layout) {
+  const { entries, selectedEntryIndex } = buildPaletteRenderEntries(state, layout.bodyWidth);
+
+  if (entries.length === 0) {
+    state.paletteScroll = 0;
+    const lines = Array.from({ length: layout.listRowCount }, (_x, i) => {
+      const content = i === 0 ? ACCENT_SOFT('No matching commands') : '';
+      return formatPalettePanelLine(layout, content);
+    });
+
+    return {
+      lines,
+      helpLabel: ACCENT_SOFT('Use ↑↓ to navigate, Enter to run · 0 results'),
+    };
+  }
+
+  syncPaletteScroll(state, entries.length, selectedEntryIndex, layout.listRowCount);
+
+  const start = state.paletteScroll;
+  const end = Math.min(entries.length, start + layout.listRowCount);
+  const lines = [];
+
+  for (let i = 0; i < layout.listRowCount; i += 1) {
+    const entry = entries[start + i];
+    if (!entry) {
+      lines.push(formatPalettePanelLine(layout, ''));
+      continue;
+    }
+
+    lines.push(
+      formatPalettePanelLine(layout, entry.content, { selected: entry.kind === 'item' && entry.selected })
+    );
+  }
+
+  const selectedLabel = `${Math.max(0, state.paletteSelection + 1)}/${state.paletteFiltered.length}`;
+  const viewLabel = entries.length > layout.listRowCount
+    ? `${start + 1}-${end}/${entries.length}`
+    : `${entries.length}`;
+
+  return {
+    lines,
+    helpLabel: ACCENT_SOFT(`Use ↑↓ to navigate, Enter to run · ${selectedLabel} · view ${viewLabel}`),
+  };
+}
+
+function formatPalettePanelLine(layout, content, { selected = false } = {}) {
+  const pad = ' '.repeat(layout.padLeft);
+  const body = padToVisible(content, layout.bodyWidth);
+  if (selected) {
+    return `${pad}${chalk.bgHex(THEME_HEX).hex('#0f1518')(`  ${body}  `)}`;
+  }
+  return `${pad}${chalk.bgHex('#111317')(`  ${body}  `)}`;
+}
+
+function drawPaletteRowInline(layout, row, content) {
+  if (row < 1 || row > layout.rows) {
+    return;
+  }
+  process.stdout.write(`\x1b[${row};1H`);
+  process.stdout.write(content);
 }
 
 function groupBySection(items) {
@@ -1028,6 +1304,33 @@ function groupBySection(items) {
     grouped[item.section].push(item);
   }
   return grouped;
+}
+
+function getModelFamilyLabel(providerId, modelId) {
+  const id = String(modelId || '');
+  const lower = id.toLowerCase();
+
+  if (providerId === 'anthropic') {
+    if (lower.includes('opus')) return 'opus';
+    if (lower.includes('sonnet')) return 'sonnet';
+    if (lower.includes('haiku')) return 'haiku';
+  }
+
+  if (providerId === 'google' && lower.startsWith('gemini-')) {
+    return lower.replace(/^gemini-/, 'gemini ');
+  }
+
+  if (providerId === 'zai' && lower.startsWith('glm-')) {
+    return lower.replace(/^glm-/, 'glm ');
+  }
+
+  return id;
+}
+
+function setProviderAndModel(cfg, client, providerId, modelId) {
+  switchProvider(cfg, client, providerId);
+  setModel(cfg, client, modelId);
+  return `switched to ${providerId}/${modelId}`;
 }
 
 function progressBar(used, max, width) {
@@ -1128,23 +1431,19 @@ async function promptHiddenInput(rl, cfg, state, promptText) {
 
   state.composerActive = false;
   state.paletteOpen = false;
+  state.suppressEcho = true;
   setNativeCursorHidden(state, false);
 
-  const previousWrite = rl._writeToOutput;
-  rl._writeToOutput = (chunk) => {
-    // Keep newline behavior, but suppress typed characters.
-    if (chunk.includes('\n') || chunk.includes('\r')) {
-      rl.output.write(chunk);
-    }
-  };
+  // Show the prompt label directly on stdout (bypasses the null sink)
+  process.stdout.write(promptText);
 
   try {
     const answer = await new Promise((resolve) => {
-      rl.question(promptText, resolve);
+      rl.once('line', resolve);
     });
     return String(answer || '').trim();
   } finally {
-    rl._writeToOutput = previousWrite;
+    state.suppressEcho = false;
     state.composerActive = wasComposerActive;
     state.paletteOpen = wasPaletteOpen;
     state.draftInput = '';
@@ -1166,57 +1465,204 @@ function renderHomeUi(cfg, state) {
   setNativeCursorHidden(state, true);
 
   const width = process.stdout.columns || 100;
+  const rows = process.stdout.rows || 36;
   const panelWidth = Math.max(56, Math.min(92, width - 16));
   const bodyWidth = panelWidth - 4;
   const padLeft = Math.max(2, Math.floor((width - panelWidth) / 2));
-  const pad = ' '.repeat(padLeft);
 
-  const providerLabel = formatProviderLabel(cfg.provider);
-  const modeLabel = state.mode === 'plan' ? 'Plan' : 'Build';
-  const modelLine = `${ACCENT(modeLabel)}  ${cfg.model} ${chalk.gray(providerLabel)}`;
-  const askLine = `${ACCENT('A')}sk anything... ${chalk.gray('"Fix a TODO in the codebase"')}`;
-  const composerLine = formatComposerLine(state, bodyWidth);
-  const preset = MODE_PRESETS[state.presetIndex] || MODE_PRESETS[0];
-  const quickActionsLeft = `${ACCENT('/models')} ${chalk.gray('pick')}  ${ACCENT('tab')} ${chalk.gray(`${preset.modeLabel}/${preset.langLabel}`)}`;
-  const quickActionsRight = `${ACCENT('/providers')} ${chalk.gray('pick')}  ${ACCENT('/key')} ${chalk.gray('secure')}`;
-  const quickActionsLine = alignRow(quickActionsLeft, quickActionsRight, bodyWidth);
-  const tipLine = `${ACCENT('Tip')} ${chalk.gray('Use /providers, /models, /key, /session, /help')}`;
+  const dynamic = buildHomeDynamicLines(cfg, state, bodyWidth);
+  const backdrop = (content = '') => chalk.bgBlack(padToVisible(content, width));
+  const canvas = Array.from({ length: rows }, () => backdrop(''));
+  const setRow = (rowNumber, text) => {
+    if (rowNumber < 1 || rowNumber > rows) return;
+    canvas[rowNumber - 1] = backdrop(text);
+  };
 
+  // ── PANEL HELPERS ──────────────────────────────────────────────────────
   const bg = (text) => chalk.bgHex('#1b1d21')(text);
   const panel = (content) => {
-    const body = padToVisible(content, bodyWidth);
+    const pad = ' '.repeat(padLeft);
+    const body = padToVisible(centerLine(content, bodyWidth), bodyWidth);
     return `${pad}${ACCENT('|')}${bg(` ${body} `)}${ACCENT('|')}`;
   };
 
-  process.stdout.write('\x1b[2J\x1b[H');
-  console.log('\n');
-  render3dLogo(width);
-  console.log();
-  console.log(panel(askLine));
-  console.log(panel(modelLine));
-  console.log(panel(composerLine));
-  console.log(panel(quickActionsLine));
-  console.log();
-  if (cfg.showTips) {
-    console.log(centerLine(tipLine, width));
-    console.log();
+  // ── SECTION 2: INPUT AREA — panel height grows with input ────────────
+  // panelRows = 1 top-pad + N ask lines + 1 bottom-pad + 1 status + 1 status-pad
+  const askLines = dynamic.askLines;            // array, length >= 1
+  const panelRows = 1 + askLines.length + 1 + 1 + 1;
+
+  // ── SECTION 1: HEADER (logo) — centered in the space above footer ─────
+  const centerBlockHeight = LOGO_LINES.length + 1 + panelRows;
+  const usableRows = rows - 5;                  // reserve 5 for footer
+  const topPadding = Math.max(1, Math.floor((usableRows - centerBlockHeight) / 2));
+
+  const logoStartRow = topPadding + 1;
+  for (let i = 0; i < LOGO_LINES.length; i += 1) {
+    const logoColor = chalk.bold.hex(THEME_HEX);
+    setRow(logoStartRow + i, centerLine(logoColor(LOGO_LINES[i]), width));
   }
-  console.log(ACCENT_SOFT(`  provider: ${cfg.provider}  |  session: ${cfg.session || 'none'}  |  mode: ${state.mode}  |  /help`));
-  console.log();
+
+  const panelStartRow = logoStartRow + LOGO_LINES.length + 1; // 1 spacer after logo
+  const askPadTopRow  = panelStartRow;
+  const askStartRow   = panelStartRow + 1;      // first ask line
+  const askPadBotRow  = askStartRow + askLines.length;
+  const statusRow     = askPadBotRow + 1;
+  const statusPadRow  = askPadBotRow + 2;
+
+  setRow(askPadTopRow, panel(''));
+  for (let i = 0; i < askLines.length; i += 1) {
+    setRow(askStartRow + i, panel(askLines[i]));
+  }
+  setRow(askPadBotRow, panel(''));
+  setRow(statusRow, panel(dynamic.statusLine));
+  setRow(statusPadRow, panel(''));
+
+  // ── SECTION 3: FOOTER — anchored to bottom ────────────────────────────
+  const footerRow1 = rows - 3;
+  const footerRow2 = rows - 1;
+  const footerRow3 = rows;
+
+  const hintLeft = `${ACCENT('tab')} ${chalk.gray('agents')}`;
+  const hintRight = `${ACCENT('ctrl+p')} ${chalk.gray('commands')}`;
+  setRow(footerRow1, alignRow(`  ${hintLeft}`, `${hintRight}  `, width));
+  setRow(footerRow2, '');
+  setRow(footerRow3, `  ${ACCENT('●')} ${ACCENT('Tip:')} ${chalk.gray(state.tipHint)}`);
+
+  // ── SAVE LAYOUT for inline updates ────────────────────────────────────
+  state.homeLayout = {
+    width, rows, bodyWidth, padLeft,
+    askPadTopRow,
+    askStartRow,
+    askLineCount: askLines.length,
+    askPadBotRow,
+    statusRow,
+    statusPadRow,
+    footerRow1, footerRow2, footerRow3,
+  };
+
+  process.stdout.write('\x1b[2J\x1b[H' + canvas.join('\n'));
 }
 
-function render3dLogo(width) {
-  const logoColor = chalk.bold.hex(THEME_HEX);
+function buildHomeDynamicLines(cfg, state, bodyWidth) {
+  const providerLabel = formatProviderLabel(cfg.provider);
+  const modeLabel = state.mode === 'plan' ? 'Plan' : 'Build';
+  const askLines = formatAskLines(state, bodyWidth);
+  const statusLine = `${ACCENT(modeLabel)} ${chalk.gray('|')} ${ACCENT_SOFT(cfg.model)} ${chalk.gray('|')} ${ACCENT(providerLabel)}`;
 
-  for (const line of LOGO_LINES) {
-    console.log(centerLine(logoColor(line), width));
+  return { askLines, statusLine };
+}
+
+function buildHomePanelLine(state, content) {
+  if (!state.homeLayout) return content;
+  const { bodyWidth, padLeft } = state.homeLayout;
+  const pad = ' '.repeat(padLeft);
+  const bg = (text) => chalk.bgHex('#1b1d21')(text);
+  const body = padToVisible(centerLine(content, bodyWidth), bodyWidth);
+  return `${pad}${ACCENT('|')}${bg(` ${body} `)}${ACCENT('|')}`;
+}
+
+/**
+ * Redraw all panel rows atomically in a single stdout.write.
+ * If the number of ask-lines changed (user typed/pasted enough to wrap),
+ * trigger a full renderHomeUi instead so the whole canvas stays consistent.
+ */
+function renderPanelInline(cfg, state) {
+  if (!state.composerActive || state.paletteOpen || !state.homeLayout) return;
+
+  const { bodyWidth, width, askPadTopRow, askStartRow, askLineCount, askPadBotRow, statusRow, statusPadRow } = state.homeLayout;
+  const dynamic = buildHomeDynamicLines(cfg, state, bodyWidth);
+  const newAskLines = dynamic.askLines;
+
+  // Line count changed → full redraw to reposition everything
+  if (newAskLines.length !== askLineCount) {
+    renderHomeUi(cfg, state);
+    return;
   }
+
+  const bg = (content) => chalk.bgBlack(padToVisible(content, width));
+  const empty = bg(buildHomePanelLine(state, ''));
+  const status = bg(buildHomePanelLine(state, dynamic.statusLine));
+
+  let buf = '\x1b7';
+  buf += `\x1b[${askPadTopRow};1H${empty}`;
+  for (let i = 0; i < newAskLines.length; i += 1) {
+    buf += `\x1b[${askStartRow + i};1H${bg(buildHomePanelLine(state, newAskLines[i]))}`;
+  }
+  buf += `\x1b[${askPadBotRow};1H${empty}`;
+  buf += `\x1b[${statusRow};1H${status}`;
+  buf += `\x1b[${statusPadRow};1H${empty}`;
+  buf += '\x1b8';
+
+  process.stdout.write(buf);
 }
 
 function formatProviderLabel(provider) {
   if (provider === 'zai') return 'Z.AI';
   if (!provider) return 'unknown';
   return String(provider);
+}
+
+function formatLangLabel(lang) {
+  const match = MODE_PRESETS.find((preset) => preset.lang === lang);
+  return match ? match.langLabel : String(lang || 'unknown');
+}
+
+/**
+ * Returns an array of styled lines for the input panel.
+ * - Empty input → [placeholder] (1 line)
+ * - Paste detected → [compact paste indicator] (1 line)
+ * - Typed text → wrapped across as many lines as needed
+ */
+function formatAskLines(state, bodyWidth) {
+  const askHint = state.askHint || 'Fix broken tests';
+  const cursorChar = chalk.bgWhite.black('A');
+  const placeholder = [`${cursorChar}${ACCENT('sk anything...')} ${chalk.gray(`"${askHint}"`)}`];
+
+  if (!state.composerActive) return placeholder;
+
+  const rawInput = String(state.draftInput || '');
+  if (!rawInput) return placeholder;
+
+  // Paste indicator: compact summary instead of wrapping potentially huge text
+  if (state.pasteInfo) {
+    const { lines, chars } = state.pasteInfo;
+    const preview = rawInput.slice(0, Math.min(24, bodyWidth - 26));
+    const ellipsis = rawInput.length > preview.length ? '…' : '';
+    return [
+      `${ACCENT_BOLD('[Pasted')} ${chalk.white(`~${lines} line${lines === 1 ? '' : 's'}, ${chars} chars`)}${ACCENT_BOLD(']')} ${chalk.gray(preview)}${ellipsis}`,
+    ];
+  }
+
+  // Wrap typed text across panel width with inline cursor
+  return wrapInputLines(rawInput, state.cursorPos, Math.max(8, bodyWidth - 2));
+}
+
+/** Split raw input into panel-width chunks, placing the block cursor inline. */
+function wrapInputLines(raw, cursorPos, maxWidth) {
+  const safeCursor = Math.max(0, Math.min(
+    Number.isInteger(cursorPos) ? cursorPos : raw.length,
+    raw.length
+  ));
+
+  const chunks = [];
+  let i = 0;
+  while (i < raw.length) {
+    chunks.push(raw.slice(i, i + maxWidth));
+    i += maxWidth;
+  }
+  if (chunks.length === 0) chunks.push('');
+
+  const cursorChunk = Math.floor(safeCursor / maxWidth);
+  const cursorCol   = safeCursor % maxWidth;
+
+  return chunks.map((chunk, idx) => {
+    if (idx !== cursorChunk) return chalk.white(chunk);
+    const before    = chunk.slice(0, cursorCol);
+    const atCursor  = chunk[cursorCol];
+    const after     = chunk.slice(cursorCol + 1);
+    const glyph     = atCursor ? chalk.bgWhite.black(atCursor) : ACCENT_BOLD('▌');
+    return chalk.white(before) + glyph + chalk.white(after);
+  });
 }
 
 function formatComposerLine(state, bodyWidth) {
@@ -1280,12 +1726,6 @@ function centerLine(line, width) {
 function alignRow(left, right, width) {
   const gap = Math.max(1, width - visibleLength(left) - visibleLength(right));
   return `${left}${' '.repeat(gap)}${right}`;
-}
-
-function alignRight(line, width) {
-  const len = visibleLength(line);
-  const left = Math.max(0, width - len);
-  return `${' '.repeat(left)}${line}`;
 }
 
 function padToVisible(text, width) {
